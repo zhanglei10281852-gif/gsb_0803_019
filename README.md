@@ -29,17 +29,21 @@ stay independent:
 ## Core semantics
 
 - **Revision** is a per-stream monotonic counter. It advances by exactly one
-  for every applied submission. An idempotent replay does **not** advance it.
+  for every applied submission **or cutover**. An idempotent replay of either
+  does **not** advance it.
 - **Head** (per rendition, current generation) is the largest sequence `H`
-  such that sequences `0..H` are all present. It is `null` when sequence `0`
-  is missing and never jumps a hole — out-of-order segments are buffered until
-  the gap fills.
+  such that every sequence from the generation's **splice point** through `H`
+  is present. It is `null` until the splice point itself arrives and never
+  jumps a hole — out-of-order segments are buffered until the gap fills. For
+  the initial generation the splice point is `0`.
 - **Watermark** (per stream) is the minimum head across **all active
-  renditions** of the **current generation** (the highest generation observed).
-  It is `null` unless every active rendition has a head in that generation.
-- **Generations**: status and watermark are always scoped to the current
-  generation. Starting a new generation resets the watermark until the new
-  generation is contiguous across all renditions.
+  renditions of the current generation**. It is `null` unless every active
+  rendition of the current generation has a head.
+- **Generations & cutover**: status, active renditions and watermark are always
+  scoped to the current generation. A cutover switches to a strictly higher
+  generation with a new active-rendition set and per-rendition splice points;
+  the new generation advances the watermark only from those splice points and
+  never borrows the old generation's head or buffered segments.
 
 ### Idempotency, conflict, atomicity
 
@@ -51,6 +55,26 @@ stay independent:
   a new `submissionId`) is a `409 conflict`.
 - A batch is all-or-nothing: all validation and conflict checks run before any
   write, so a rejected batch leaves no partial segments.
+
+### Cutover (lossless active/standby switch)
+
+- A cutover is keyed by `cutoverId` and guarded by `expectedRevision`
+  (optimistic concurrency).
+- **Idempotent retry**: a verbatim re-send of an accepted cutover (e.g. after a
+  lost response) returns `200`, does not switch again, and does not bump the
+  revision. Idempotency is checked *before* `expectedRevision`, so the retry
+  succeeds even though the revision has since advanced.
+- **Stable conflicts** (`409`): same `cutoverId` with drifted content, a
+  generation that does not advance past the current one, a stale
+  `expectedRevision`, or an invalid/empty rendition set or missing splice point.
+- **Fencing**: after a cutover, any report for a superseded generation is
+  rejected with `409` code `fenced`, leaving revision, idempotency records and
+  the watermark untouched. Old-generation writes already in flight either
+  complete fully before the linearized cutover or fail with no side effects.
+- Because all operations on a stream are serialized under one lock, concurrent
+  cutovers and writes always reduce to some serial order; at most one cutover
+  from a given `expectedRevision` applies.
+
 
 ## HTTP contract
 
@@ -91,16 +115,43 @@ Request:
 ```
 - `201 Created` — batch applied (`"applied": true`).
 - `200 OK` — idempotent replay (`"applied": false`, revision unchanged).
-- `409 Conflict` — submissionId reused with different content, or a sequence
-  rewritten with different bytes.
+- `409 Conflict` — submissionId reused with different content, a sequence
+  rewritten with different bytes, or a report for a **superseded generation**
+  (code `fenced`).
 - `400 Bad Request` — empty batch, non-positive duration, invalid sha256,
-  unknown rendition, empty submissionId, duplicate sequence within the batch.
+  rendition not active for the generation, empty submissionId, duplicate
+  sequence within the batch, or a sequence below the generation's splice point.
 - `404 Not Found` — stream does not exist.
 
 Response body (`submitView`):
 ```json
 { "applied": true, "status": { /* status view */ } }
 ```
+
+### `POST /v1/streams/{streamId}/cutover`
+Atomically switch to a higher generation with a new active-rendition set and
+per-rendition splice points.
+
+Request:
+```json
+{
+  "cutoverId": "switch-2024-06-01T12:00Z",
+  "expectedRevision": 42,
+  "generation": 2,
+  "renditions": ["720p", "480p"],
+  "splicePoints": { "720p": 128, "480p": 96 }
+}
+```
+- `201 Created` — cutover applied (`"applied": true`).
+- `200 OK` — idempotent retry of the same cutover (`"applied": false`,
+  revision unchanged).
+- `409 Conflict` — reused `cutoverId` with drifted content, non-advancing
+  generation, stale `expectedRevision`, or invalid rendition set / missing
+  splice point.
+- `400 Bad Request` — empty `cutoverId`.
+- `404 Not Found` — stream does not exist.
+
+Response body is the same `submitView` shape as segment submission.
 
 ### `GET /v1/streams/{streamId}`
 Return the current status snapshot.
@@ -114,15 +165,16 @@ Return the current status snapshot.
   "currentGeneration": 1,
   "watermark": 0,
   "renditions": {
-    "720p": { "generation": 1, "head": 1, "segmentCount": 2, "buffered": [] },
-    "1080p": { "generation": 1, "head": 0, "segmentCount": 1, "buffered": [] }
+    "720p": { "generation": 1, "splicePoint": 0, "head": 1, "segmentCount": 2, "buffered": [] },
+    "1080p": { "generation": 1, "splicePoint": 0, "head": 0, "segmentCount": 1, "buffered": [] }
   }
 }
 ```
 - `404 Not Found` — unknown stream.
 
 Error responses use `{ "error": "<message>", "code": "<label>" }` where `code`
-is one of `validation`, `conflict`, `already_exists`, `not_found`, `internal`.
+is one of `validation`, `conflict`, `already_exists`, `fenced`, `not_found`,
+`internal`.
 
 ## Running
 
@@ -138,6 +190,9 @@ go test ./...
 ```
 
 Coverage includes domain unit tests (head/watermark/generation math,
-idempotency, conflict, batch atomicity), service concurrency tests
-(serializable revisions, concurrent replay), and real HTTP regression tests
-via `httptest` (full request/response cycle, status codes, concurrency).
+idempotency, conflict, batch atomicity, cutover splice/fencing), service
+concurrency tests (serializable revisions, concurrent replay, concurrent
+cutover vs. late writes, single-winner cutover), and real HTTP regression
+tests via `httptest` (full request/response cycle, status codes, and the
+cutover scenarios: concurrent cutovers, partial new-primary readiness, late
+old-generation writes, and lost responses).

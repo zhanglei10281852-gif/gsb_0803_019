@@ -33,6 +33,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("POST /v1/streams", s.handleCreateStream)
 	s.mux.HandleFunc("POST /v1/streams/{streamId}/segments", s.handleSubmit)
+	s.mux.HandleFunc("POST /v1/streams/{streamId}/cutover", s.handleCutover)
 	s.mux.HandleFunc("GET /v1/streams/{streamId}", s.handleStatus)
 }
 
@@ -56,8 +57,17 @@ type submitBody struct {
 	Segments     []segmentBody `json:"segments"`
 }
 
+type cutoverBody struct {
+	CutoverID        string            `json:"cutoverId"`
+	ExpectedRevision uint64            `json:"expectedRevision"`
+	Generation       uint64            `json:"generation"`
+	Renditions       []string          `json:"renditions"`
+	SplicePoints     map[string]uint64 `json:"splicePoints"`
+}
+
 type renditionStatusView struct {
 	Generation   *uint64  `json:"generation"`
+	SplicePoint  *uint64  `json:"splicePoint"`
 	Head         *uint64  `json:"head"`
 	SegmentCount int      `json:"segmentCount"`
 	Buffered     []uint64 `json:"buffered"`
@@ -145,6 +155,31 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toStatusView(snap))
 }
 
+func (s *Server) handleCutover(w http.ResponseWriter, r *http.Request) {
+	var body cutoverBody
+	if !decode(w, r, &body) {
+		return
+	}
+	resp, err := s.coord.Cutover(service.CutoverRequest{
+		StreamID:         r.PathValue("streamId"),
+		CutoverID:        body.CutoverID,
+		ExpectedRevision: body.ExpectedRevision,
+		Generation:       body.Generation,
+		Renditions:       body.Renditions,
+		SplicePoints:     body.SplicePoints,
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	// A fresh cutover returns 201; an idempotent retry returns 200.
+	code := http.StatusOK
+	if resp.Result.Applied {
+		code = http.StatusCreated
+	}
+	writeJSON(w, code, submitView{Applied: resp.Result.Applied, Status: toStatusView(resp.Snapshot)})
+}
+
 // --- helpers ---
 
 func toStatusView(snap domain.Snapshot) statusView {
@@ -156,6 +191,7 @@ func toStatusView(snap domain.Snapshot) statusView {
 		}
 		rends[name] = renditionStatusView{
 			Generation:   rs.Generation,
+			SplicePoint:  rs.SplicePoint,
 			Head:         rs.Head,
 			SegmentCount: rs.SegmentCount,
 			Buffered:     buffered,
@@ -202,6 +238,10 @@ func writeErr(w http.ResponseWriter, err error) {
 		code, label = http.StatusConflict, "conflict"
 	case domain.KindAlreadyExists:
 		code, label = http.StatusConflict, "already_exists"
+	case domain.KindFenced:
+		// A superseded generation is a stable conflict with the linearized
+		// cutover; it is rejected without side effects.
+		code, label = http.StatusConflict, "fenced"
 	case domain.KindNotFound:
 		code, label = http.StatusNotFound, "not_found"
 	default:

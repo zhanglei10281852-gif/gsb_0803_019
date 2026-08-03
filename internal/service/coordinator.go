@@ -109,3 +109,48 @@ func (c *Coordinator) Status(streamID string) (domain.Snapshot, error) {
 	}
 	return snap, nil
 }
+
+// CutoverRequest carries a lossless active/standby switch.
+type CutoverRequest struct {
+	StreamID         string
+	CutoverID        string
+	ExpectedRevision uint64
+	Generation       uint64
+	Renditions       []string
+	SplicePoints     map[string]uint64
+}
+
+// CutoverResponse pairs the cutover result with a snapshot taken under the same
+// lock, so the reported revision matches committed state.
+type CutoverResponse struct {
+	Result   domain.CutoverResult
+	Snapshot domain.Snapshot
+}
+
+// Cutover performs an atomic generation switch on an existing stream.
+func (c *Coordinator) Cutover(req CutoverRequest) (CutoverResponse, error) {
+	var resp CutoverResponse
+	var opErr error
+	found := c.store.With(req.StreamID, func(s *domain.Stream) {
+		res, err := s.Cutover(domain.CutoverSpec{
+			CutoverID:        req.CutoverID,
+			ExpectedRevision: req.ExpectedRevision,
+			Generation:       req.Generation,
+			Renditions:       req.Renditions,
+			SplicePoints:     req.SplicePoints,
+		})
+		if err != nil {
+			opErr = err
+			return
+		}
+		resp.Result = res
+		resp.Snapshot = s.Snapshot()
+	})
+	if !found {
+		return CutoverResponse{}, &domain.Error{Kind: domain.KindNotFound, Msg: "stream not found"}
+	}
+	if opErr != nil {
+		return CutoverResponse{}, opErr
+	}
+	return resp, nil
+}
