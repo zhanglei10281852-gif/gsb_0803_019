@@ -69,9 +69,10 @@ func (c *Coordinator) CreateStream(ctx context.Context, in CreateStreamInput) (*
 		ActiveRenditions: active,
 		Renditions:       make(map[string]*RenditionState, len(active)),
 		Submissions:      make(map[string]*SubmissionRecord),
+		Cutovers:         make(map[string]*CutoverRecord),
 	}
 	for name := range active {
-		s.Renditions[name] = newRenditionState(name)
+		s.Renditions[name] = newRenditionState(name, 0)
 	}
 
 	if err := c.store.CreateStream(ctx, s); err != nil {
@@ -104,18 +105,52 @@ func (c *Coordinator) SubmitSegments(ctx context.Context, in SubmitSegmentsInput
 
 	if s.GenerationSet && in.Generation < s.CurrentGeneration {
 		return nil, NewError(ErrCodeStaleGeneration, fmt.Sprintf(
-			"generation %d is stale; current generation is %d", in.Generation, s.CurrentGeneration))
+			"generation %d is fenced; current generation is %d", in.Generation, s.CurrentGeneration))
 	}
 
-	if !s.GenerationSet || in.Generation > s.CurrentGeneration {
+	if s.GenerationSet && in.Generation > s.CurrentGeneration {
+		return nil, NewError(ErrCodeCutoverRequired, fmt.Sprintf(
+			"generation %d is ahead of current %d; an atomic cutover is required to advance generation",
+			in.Generation, s.CurrentGeneration))
+	}
+
+	if !s.GenerationSet {
 		s.CurrentGeneration = in.Generation
 		s.GenerationSet = true
-		resetRenditions(s)
-		s.Submissions = make(map[string]*SubmissionRecord)
 	}
 
 	key := submissionKey(in.Rendition, in.Generation, in.SubmissionID)
-	contentHash := submissionContentHash(in.Segments)
+
+	rs := s.Renditions[in.Rendition]
+
+	normalized := make([]Segment, len(in.Segments))
+	seen := make(map[int64]struct{}, len(in.Segments))
+	for i, seg := range in.Segments {
+		if seg.Sequence < 0 {
+			return nil, NewError(ErrCodeInvalidRequest, "segment sequence must be >= 0")
+		}
+		if seg.Sequence < rs.StartSequence {
+			return nil, NewError(ErrCodeSegmentOutOfRange, fmt.Sprintf(
+				"segment sequence %d is before rendition start sequence %d in generation %d",
+				seg.Sequence, rs.StartSequence, in.Generation))
+		}
+		if seg.DurationMs <= 0 {
+			return nil, NewError(ErrCodeInvalidRequest, "segment durationMs must be > 0")
+		}
+		seg.Sha256 = normalizeSha256(seg.Sha256)
+		if !sha256Hex.MatchString(seg.Sha256) {
+			return nil, NewError(ErrCodeInvalidRequest, fmt.Sprintf(
+				"segment %d has invalid sha256: %q", seg.Sequence, in.Segments[i].Sha256))
+		}
+		if _, dup := seen[seg.Sequence]; dup {
+			return nil, NewError(ErrCodeInvalidRequest, fmt.Sprintf(
+				"duplicate sequence %d in submission", seg.Sequence))
+		}
+		seen[seg.Sequence] = struct{}{}
+		normalized[i] = seg
+	}
+
+	contentHash := submissionContentHash(normalized)
 
 	if rec, exists := s.Submissions[key]; exists {
 		if rec.ContentHash != contentHash {
@@ -123,7 +158,6 @@ func (c *Coordinator) SubmitSegments(ctx context.Context, in SubmitSegmentsInput
 				"submissionId %q already exists for this stream/rendition/generation with different content",
 				in.SubmissionID))
 		}
-		rs := s.Renditions[in.Rendition]
 		return &SubmitResultView{
 			StreamID:     s.ID,
 			Rendition:    in.Rendition,
@@ -137,30 +171,8 @@ func (c *Coordinator) SubmitSegments(ctx context.Context, in SubmitSegmentsInput
 		}, nil
 	}
 
-	rs := s.Renditions[in.Rendition]
-
-	newSegments := make([]Segment, 0, len(in.Segments))
-	seen := make(map[int64]struct{}, len(in.Segments))
-	for _, seg := range in.Segments {
-		if seg.Sequence < 0 {
-			return nil, NewError(ErrCodeInvalidRequest, "segment sequence must be >= 0")
-		}
-		if seg.DurationMs <= 0 {
-			return nil, NewError(ErrCodeInvalidRequest, "segment durationMs must be > 0")
-		}
-		normalized := normalizeSha256(seg.Sha256)
-		if !sha256Hex.MatchString(normalized) {
-			return nil, NewError(ErrCodeInvalidRequest, fmt.Sprintf(
-				"segment %d has invalid sha256: %q", seg.Sequence, seg.Sha256))
-		}
-		seg.Sha256 = normalized
-
-		if _, dup := seen[seg.Sequence]; dup {
-			return nil, NewError(ErrCodeInvalidRequest, fmt.Sprintf(
-				"duplicate sequence %d in submission", seg.Sequence))
-		}
-		seen[seg.Sequence] = struct{}{}
-
+	newSegments := make([]Segment, 0, len(normalized))
+	for _, seg := range normalized {
 		if existing, ok := rs.Segments[seg.Sequence]; ok {
 			if existing.Sha256 != seg.Sha256 || existing.DurationMs != seg.DurationMs {
 				return nil, NewError(ErrCodeConflict, fmt.Sprintf(
@@ -214,21 +226,79 @@ func (c *Coordinator) GetStatus(ctx context.Context, streamID string) (*StreamVi
 	return streamToView(s), nil
 }
 
-func newRenditionState(name string) *RenditionState {
-	return &RenditionState{
-		Name:     name,
-		Segments: make(map[int64]Segment),
+func (c *Coordinator) Cutover(ctx context.Context, in CutoverInput) (*CutoverView, error) {
+	if err := validateCutoverInput(in); err != nil {
+		return nil, err
 	}
+
+	s, ok := c.store.GetStream(ctx, in.StreamID)
+	if !ok {
+		return nil, NewError(ErrCodeStreamNotFound, "stream not found: "+in.StreamID)
+	}
+
+	l := c.streamLock(s.ID)
+	l.Lock()
+	defer l.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	contentHash := cutoverContentHash(in.Generation, in.ExpectedRevision, in.Renditions)
+
+	if rec, exists := s.Cutovers[in.CutoverID]; exists {
+		if rec.ContentHash != contentHash {
+			return nil, NewError(ErrCodeCutoverConflict, fmt.Sprintf(
+				"cutoverId %q already exists with different content", in.CutoverID))
+		}
+		return cutoverToView(s, in.CutoverID, rec.AppliedRevision, true), nil
+	}
+
+	if in.ExpectedRevision != s.Revision {
+		return nil, NewError(ErrCodeRevisionMismatch, fmt.Sprintf(
+			"expectedRevision %d does not match current revision %d",
+			in.ExpectedRevision, s.Revision))
+	}
+
+	if s.GenerationSet && in.Generation <= s.CurrentGeneration {
+		return nil, NewError(ErrCodeStaleGeneration, fmt.Sprintf(
+			"cutover generation %d must be greater than current generation %d",
+			in.Generation, s.CurrentGeneration))
+	}
+
+	active := make(map[string]struct{}, len(in.Renditions))
+	renditions := make(map[string]*RenditionState, len(in.Renditions))
+	for name, start := range in.Renditions {
+		active[name] = struct{}{}
+		renditions[name] = newRenditionState(name, start)
+	}
+
+	s.ActiveRenditions = active
+	s.Renditions = renditions
+	s.CurrentGeneration = in.Generation
+	s.GenerationSet = true
+	s.Submissions = make(map[string]*SubmissionRecord)
+	s.Revision++
+	appliedRevision := s.Revision
+
+	s.Cutovers[in.CutoverID] = &CutoverRecord{
+		CutoverID:        in.CutoverID,
+		Generation:       in.Generation,
+		ExpectedRevision: in.ExpectedRevision,
+		ContentHash:      contentHash,
+		AppliedRevision:  appliedRevision,
+		Renditions:       copyStartMap(in.Renditions),
+	}
+
+	return cutoverToView(s, in.CutoverID, appliedRevision, false), nil
 }
 
-func resetRenditions(s *Stream) {
-	for name := range s.ActiveRenditions {
-		s.Renditions[name] = newRenditionState(name)
-	}
-	for name := range s.Renditions {
-		if _, active := s.ActiveRenditions[name]; !active {
-			delete(s.Renditions, name)
-		}
+func newRenditionState(name string, startSequence int64) *RenditionState {
+	return &RenditionState{
+		Name:          name,
+		StartSequence: startSequence,
+		HeadSequence:  startSequence,
+		Segments:      make(map[int64]Segment),
 	}
 }
 
@@ -244,42 +314,33 @@ func advanceHead(rs *RenditionState) {
 }
 
 func computeWatermark(s *Stream) WatermarkView {
-	wmSeq := int64(math.MaxInt64)
-	wmMs := int64(math.MaxInt64)
-	for name := range s.ActiveRenditions {
-		rs := s.Renditions[name]
-		if rs.HeadSequence < wmSeq {
-			wmSeq = rs.HeadSequence
-		}
-		if rs.ContiguousMs < wmMs {
-			wmMs = rs.ContiguousMs
-		}
-	}
-	if wmSeq == math.MaxInt64 {
+	if len(s.ActiveRenditions) == 0 {
 		return WatermarkView{}
 	}
-	return WatermarkView{Sequence: wmSeq, TimeMs: wmMs}
+	var maxStart int64 = math.MinInt64
+	minHead := int64(math.MaxInt64)
+	minMs := int64(math.MaxInt64)
+	for name := range s.ActiveRenditions {
+		rs := s.Renditions[name]
+		if rs.StartSequence > maxStart {
+			maxStart = rs.StartSequence
+		}
+		if rs.HeadSequence < minHead {
+			minHead = rs.HeadSequence
+		}
+		if rs.ContiguousMs < minMs {
+			minMs = rs.ContiguousMs
+		}
+	}
+	if minHead >= maxStart {
+		return WatermarkView{Sequence: minHead, TimeMs: minMs}
+	}
+	return WatermarkView{Sequence: maxStart, TimeMs: 0}
 }
 
 func streamToView(s *Stream) *StreamView {
-	active := make([]string, 0, len(s.ActiveRenditions))
-	for name := range s.ActiveRenditions {
-		active = append(active, name)
-	}
-	sort.Strings(active)
-
-	renditions := make(map[string]RenditionView, len(s.Renditions))
-	for name, rs := range s.Renditions {
-		buffered := len(rs.Segments) - int(rs.HeadSequence)
-		if buffered < 0 {
-			buffered = 0
-		}
-		renditions[name] = RenditionView{
-			HeadSequence:     rs.HeadSequence,
-			ContiguousTimeMs: rs.ContiguousMs,
-			BufferedSegments: buffered,
-		}
-	}
+	active := sortedActiveNames(s.ActiveRenditions)
+	renditions := renditionsToView(s.Renditions)
 
 	gen := int64(0)
 	if s.GenerationSet {
@@ -294,6 +355,57 @@ func streamToView(s *Stream) *StreamView {
 		Renditions:       renditions,
 		Watermark:        computeWatermark(s),
 	}
+}
+
+func cutoverToView(s *Stream, cutoverID string, revision int64, idempotent bool) *CutoverView {
+	return &CutoverView{
+		StreamID:         s.ID,
+		CutoverID:        cutoverID,
+		Generation:       s.CurrentGeneration,
+		Revision:         revision,
+		Idempotent:       idempotent,
+		ActiveRenditions: sortedActiveNames(s.ActiveRenditions),
+		Renditions:       renditionsToView(s.Renditions),
+		Watermark:        computeWatermark(s),
+	}
+}
+
+func sortedActiveNames(active map[string]struct{}) []string {
+	names := make([]string, 0, len(active))
+	for name := range active {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func renditionsToView(renditions map[string]*RenditionState) map[string]RenditionView {
+	view := make(map[string]RenditionView, len(renditions))
+	for name, rs := range renditions {
+		committed := rs.HeadSequence - rs.StartSequence
+		if committed < 0 {
+			committed = 0
+		}
+		buffered := len(rs.Segments) - int(committed)
+		if buffered < 0 {
+			buffered = 0
+		}
+		view[name] = RenditionView{
+			StartSequence:    rs.StartSequence,
+			HeadSequence:     rs.HeadSequence,
+			ContiguousTimeMs: rs.ContiguousMs,
+			BufferedSegments: buffered,
+		}
+	}
+	return view
+}
+
+func copyStartMap(m map[string]int64) map[string]int64 {
+	cp := make(map[string]int64, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
 }
 
 func validateSubmitInput(in SubmitSegmentsInput) error {
@@ -328,6 +440,48 @@ func submissionContentHash(segments []Segment) string {
 	h := sha256.New()
 	for _, seg := range sorted {
 		fmt.Fprintf(h, "%d|%d|%s;", seg.Sequence, seg.DurationMs, seg.Sha256)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func validateCutoverInput(in CutoverInput) error {
+	if in.StreamID == "" {
+		return NewError(ErrCodeInvalidRequest, "streamId is required")
+	}
+	if in.CutoverID == "" {
+		return NewError(ErrCodeInvalidRequest, "cutoverId is required")
+	}
+	if in.Generation < 0 {
+		return NewError(ErrCodeInvalidRequest, "generation must be >= 0")
+	}
+	if in.ExpectedRevision < 0 {
+		return NewError(ErrCodeInvalidRequest, "expectedRevision must be >= 0")
+	}
+	if len(in.Renditions) == 0 {
+		return NewError(ErrCodeInvalidRequest, "renditions must not be empty")
+	}
+	for name, start := range in.Renditions {
+		if name == "" {
+			return NewError(ErrCodeInvalidRequest, "rendition name must not be empty")
+		}
+		if start < 0 {
+			return NewError(ErrCodeInvalidRequest, fmt.Sprintf(
+				"start sequence for rendition %q must be >= 0", name))
+		}
+	}
+	return nil
+}
+
+func cutoverContentHash(generation, expectedRevision int64, renditions map[string]int64) string {
+	names := make([]string, 0, len(renditions))
+	for name := range renditions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	h := sha256.New()
+	fmt.Fprintf(h, "gen=%d;rev=%d;", generation, expectedRevision)
+	for _, name := range names {
+		fmt.Fprintf(h, "%s=%d;", name, renditions[name])
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

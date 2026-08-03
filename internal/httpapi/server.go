@@ -28,6 +28,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("POST /v1/streams", s.handleCreateStream)
 	s.mux.HandleFunc("POST /v1/streams/{streamId}/segments", s.handleSubmitSegments)
+	s.mux.HandleFunc("POST /v1/streams/{streamId}/cutover", s.handleCutover)
 	s.mux.HandleFunc("GET /v1/streams/{streamId}", s.handleGetStream)
 }
 
@@ -99,6 +100,34 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
+type cutoverRequest struct {
+	Generation       int64            `json:"generation"`
+	CutoverID        string           `json:"cutoverId"`
+	ExpectedRevision int64            `json:"expectedRevision"`
+	Renditions       map[string]int64 `json:"renditions"`
+}
+
+func (s *Server) handleCutover(w http.ResponseWriter, r *http.Request) {
+	streamID := r.PathValue("streamId")
+	var req cutoverRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	view, err := s.coord.Cutover(r.Context(), domain.CutoverInput{
+		StreamID:         streamID,
+		Generation:       req.Generation,
+		CutoverID:        req.CutoverID,
+		ExpectedRevision: req.ExpectedRevision,
+		Renditions:       req.Renditions,
+	})
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
 type errorBody struct {
 	Error   string `json:"error"`
 	Message string `json:"message"`
@@ -144,7 +173,13 @@ func statusForCode(code string) int {
 	switch code {
 	case domain.ErrCodeStreamNotFound:
 		return http.StatusNotFound
-	case domain.ErrCodeStreamExists, domain.ErrCodeConflict, domain.ErrCodeStaleGeneration:
+	case domain.ErrCodeStreamExists,
+		domain.ErrCodeConflict,
+		domain.ErrCodeStaleGeneration,
+		domain.ErrCodeRevisionMismatch,
+		domain.ErrCodeCutoverConflict,
+		domain.ErrCodeCutoverRequired,
+		domain.ErrCodeSegmentOutOfRange:
 		return http.StatusConflict
 	case domain.ErrCodeInvalidRequest:
 		return http.StatusBadRequest

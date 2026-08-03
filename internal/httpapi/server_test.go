@@ -458,3 +458,366 @@ func TestContextCancellationDoesNotCorrupt(t *testing.T) {
 		t.Fatalf("cancelled request must not commit, revision=%d", st.Revision)
 	}
 }
+
+func cutover(t *testing.T, c *testClient, streamID string, body map[string]interface{}) (*http.Response, []byte) {
+	t.Helper()
+	return c.do("POST", "/v1/streams/"+streamID+"/cutover", body)
+}
+
+func TestHTTPCutoverSuccessAndFence(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p", "480p"})
+
+	c.do("POST", "/v1/streams/s1/segments", map[string]interface{}{
+		"rendition": "720p", "generation": 1, "submissionId": "s1",
+		"segments": []domain.Segment{seg(0, 2000, "a0"), seg(1, 2000, "a1")},
+	})
+	c.do("POST", "/v1/streams/s1/segments", map[string]interface{}{
+		"rendition": "480p", "generation": 1, "submissionId": "s2",
+		"segments": []domain.Segment{seg(0, 2000, "b0")},
+	})
+
+	resp, body := cutover(t, c, "s1", map[string]interface{}{
+		"generation":       3,
+		"cutoverId":        "co-1",
+		"expectedRevision": 2,
+		"renditions":       map[string]int64{"720p": 2, "480p": 1},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cutover status %d: %s", resp.StatusCode, body)
+	}
+	cv := decode[domain.CutoverView](t, body)
+	if cv.Generation != 3 || cv.Revision != 3 || cv.Idempotent {
+		t.Fatalf("unexpected cutover view: %+v", cv)
+	}
+	if cv.Renditions["720p"].StartSequence != 2 {
+		t.Fatalf("720p start should be 2: %+v", cv.Renditions["720p"])
+	}
+	if cv.Watermark.Sequence != 2 || cv.Watermark.TimeMs != 0 {
+		t.Fatalf("watermark should be at max start 2: %+v", cv.Watermark)
+	}
+
+	resp, body = c.do("POST", "/v1/streams/s1/segments", map[string]interface{}{
+		"rendition": "720p", "generation": 1, "submissionId": "late",
+		"segments": []domain.Segment{seg(2, 2000, "late")},
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("fenced old gen should be 409, got %d: %s", resp.StatusCode, body)
+	}
+	e := decode[apiError](t, body)
+	if e.Error != domain.ErrCodeStaleGeneration {
+		t.Fatalf("expected STALE_GENERATION, got %s", e.Error)
+	}
+
+	_, body = c.do("GET", "/v1/streams/s1", nil)
+	st := decode[domain.StreamView](t, body)
+	if st.Revision != 3 || st.Generation != 3 {
+		t.Fatalf("fenced write must not change state: rev=%d gen=%d", st.Revision, st.Generation)
+	}
+}
+
+func TestHTTPCutoverIdempotentRetry(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p"})
+	payload := map[string]interface{}{
+		"generation":       2,
+		"cutoverId":        "co-1",
+		"expectedRevision": 0,
+		"renditions":       map[string]int64{"720p": 5},
+	}
+	resp, body := cutover(t, c, "s1", payload)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	first := decode[domain.CutoverView](t, body)
+	if first.Revision != 1 || first.Idempotent {
+		t.Fatalf("unexpected first: %+v", first)
+	}
+
+	resp, body = cutover(t, c, "s1", payload)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("retry status %d: %s", resp.StatusCode, body)
+	}
+	retry := decode[domain.CutoverView](t, body)
+	if !retry.Idempotent || retry.Revision != 1 {
+		t.Fatalf("retry must be idempotent at revision 1: %+v", retry)
+	}
+}
+
+func TestHTTPCutoverDriftConflict(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p"})
+	cutover(t, c, "s1", map[string]interface{}{
+		"generation": 2, "cutoverId": "co-1", "expectedRevision": 0,
+		"renditions": map[string]int64{"720p": 5},
+	})
+	resp, body := cutover(t, c, "s1", map[string]interface{}{
+		"generation": 2, "cutoverId": "co-1", "expectedRevision": 1,
+		"renditions": map[string]int64{"720p": 6},
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", resp.StatusCode, body)
+	}
+	e := decode[apiError](t, body)
+	if e.Error != domain.ErrCodeCutoverConflict {
+		t.Fatalf("expected CUTOVER_CONFLICT, got %s", e.Error)
+	}
+}
+
+func TestHTTPCutoverRevisionMismatch(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p"})
+	c.do("POST", "/v1/streams/s1/segments", map[string]interface{}{
+		"rendition": "720p", "generation": 1, "submissionId": "s1",
+		"segments": []domain.Segment{seg(0, 2000, "a0")},
+	})
+	resp, body := cutover(t, c, "s1", map[string]interface{}{
+		"generation": 2, "cutoverId": "co-1", "expectedRevision": 0,
+		"renditions": map[string]int64{"720p": 1},
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", resp.StatusCode, body)
+	}
+	e := decode[apiError](t, body)
+	if e.Error != domain.ErrCodeRevisionMismatch {
+		t.Fatalf("expected REVISION_MISMATCH, got %s", e.Error)
+	}
+}
+
+func TestHTTPCutoverGenerationRegression(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p"})
+	cutover(t, c, "s1", map[string]interface{}{
+		"generation": 5, "cutoverId": "co-1", "expectedRevision": 0,
+		"renditions": map[string]int64{"720p": 0},
+	})
+	resp, body := cutover(t, c, "s1", map[string]interface{}{
+		"generation": 5, "cutoverId": "co-2", "expectedRevision": 1,
+		"renditions": map[string]int64{"720p": 0},
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", resp.StatusCode, body)
+	}
+	e := decode[apiError](t, body)
+	if e.Error != domain.ErrCodeStaleGeneration {
+		t.Fatalf("expected STALE_GENERATION, got %s", e.Error)
+	}
+}
+
+func TestHTTPCutoverInvalidRenditionSet(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p"})
+	cases := []map[string]interface{}{
+		{"generation": 2, "cutoverId": "co", "expectedRevision": 0},
+		{"generation": 2, "cutoverId": "co", "expectedRevision": 0, "renditions": map[string]int64{"": 0}},
+		{"generation": 2, "cutoverId": "co", "expectedRevision": 0, "renditions": map[string]int64{"720p": -1}},
+	}
+	for _, payload := range cases {
+		resp, _ := cutover(t, c, "s1", payload)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected 400 for %v, got %d", payload, resp.StatusCode)
+		}
+	}
+}
+
+func TestHTTPCutoverUnknownFieldRejected(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p"})
+	resp, _ := cutover(t, c, "s1", map[string]interface{}{
+		"generation": 2, "cutoverId": "co-1", "expectedRevision": 0,
+		"renditions": map[string]int64{"720p": 0}, "bogus": 1,
+	})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestHTTPCutoverToMissingStream(t *testing.T) {
+	c := newTestClient(t)
+	resp, body := cutover(t, c, "nope", map[string]interface{}{
+		"generation": 1, "cutoverId": "co", "expectedRevision": 0,
+		"renditions": map[string]int64{"720p": 0},
+	})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestHTTPCutoverChangesActiveRenditions(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p", "480p"})
+	resp, body := cutover(t, c, "s1", map[string]interface{}{
+		"generation": 2, "cutoverId": "co-1", "expectedRevision": 0,
+		"renditions": map[string]int64{"720p": 0, "1080p": 0},
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	cv := decode[domain.CutoverView](t, body)
+	if _, ok := cv.Renditions["480p"]; ok {
+		t.Fatal("480p should be removed")
+	}
+	if _, ok := cv.Renditions["1080p"]; !ok {
+		t.Fatal("1080p should be added")
+	}
+}
+
+func TestHTTPPartialNewPrimaryReadiness(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p", "480p"})
+	cutover(t, c, "s1", map[string]interface{}{
+		"generation": 2, "cutoverId": "co-1", "expectedRevision": 0,
+		"renditions": map[string]int64{"720p": 10, "480p": 8},
+	})
+
+	_, body := c.do("POST", "/v1/streams/s1/segments", map[string]interface{}{
+		"rendition": "720p", "generation": 2, "submissionId": "s1",
+		"segments": []domain.Segment{seg(10, 2000, "c10"), seg(11, 2000, "c11")},
+	})
+	r720 := decode[domain.SubmitResultView](t, body)
+	if r720.Watermark.Sequence != 10 || r720.Watermark.TimeMs != 0 {
+		t.Fatalf("watermark must wait at 10/0: %+v", r720.Watermark)
+	}
+
+	_, body = c.do("POST", "/v1/streams/s1/segments", map[string]interface{}{
+		"rendition": "480p", "generation": 2, "submissionId": "s2",
+		"segments": []domain.Segment{seg(8, 2000, "d8"), seg(9, 2000, "d9")},
+	})
+	r480 := decode[domain.SubmitResultView](t, body)
+	if r480.Watermark.Sequence != 10 || r480.Watermark.TimeMs != 4000 {
+		t.Fatalf("watermark should advance to 10/4000: %+v", r480.Watermark)
+	}
+}
+
+func TestHTTPSubmitHigherGenerationWithoutCutover(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p"})
+	c.do("POST", "/v1/streams/s1/segments", map[string]interface{}{
+		"rendition": "720p", "generation": 1, "submissionId": "s1",
+		"segments": []domain.Segment{seg(0, 2000, "a0")},
+	})
+	resp, body := c.do("POST", "/v1/streams/s1/segments", map[string]interface{}{
+		"rendition": "720p", "generation": 2, "submissionId": "s2",
+		"segments": []domain.Segment{seg(1, 2000, "a1")},
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", resp.StatusCode, body)
+	}
+	e := decode[apiError](t, body)
+	if e.Error != domain.ErrCodeCutoverRequired {
+		t.Fatalf("expected CUTOVER_REQUIRED, got %s", e.Error)
+	}
+}
+
+func TestHTTPSegmentBeforeStartRejected(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p"})
+	cutover(t, c, "s1", map[string]interface{}{
+		"generation": 2, "cutoverId": "co-1", "expectedRevision": 0,
+		"renditions": map[string]int64{"720p": 5},
+	})
+	resp, body := c.do("POST", "/v1/streams/s1/segments", map[string]interface{}{
+		"rendition": "720p", "generation": 2, "submissionId": "s1",
+		"segments": []domain.Segment{seg(4, 2000, "below")},
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", resp.StatusCode, body)
+	}
+	e := decode[apiError](t, body)
+	if e.Error != domain.ErrCodeSegmentOutOfRange {
+		t.Fatalf("expected SEGMENT_OUT_OF_RANGE, got %s", e.Error)
+	}
+	_, b := c.do("GET", "/v1/streams/s1", nil)
+	st := decode[domain.StreamView](t, b)
+	if st.Renditions["720p"].BufferedSegments != 0 || st.Renditions["720p"].HeadSequence != 5 {
+		t.Fatalf("no partial state should remain: %+v", st.Renditions["720p"])
+	}
+}
+
+func TestHTTPConcurrentCutoversSerializable(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p"})
+	const n = 20
+	var wg sync.WaitGroup
+	statuses := make(chan int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			payload := map[string]interface{}{
+				"generation":       int64(i + 2),
+				"cutoverId":        fmt.Sprintf("co-%d", i),
+				"expectedRevision": 0,
+				"renditions":       map[string]int64{"720p": int64(i)},
+			}
+			b, _ := json.Marshal(payload)
+			req, _ := http.NewRequest("POST", c.server.URL+"/v1/streams/s1/cutover", bytes.NewReader(b))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Errorf("request: %v", err)
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			statuses <- resp.StatusCode
+		}(i)
+	}
+	wg.Wait()
+	close(statuses)
+	ok := 0
+	conflict := 0
+	for s := range statuses {
+		switch s {
+		case http.StatusOK:
+			ok++
+		case http.StatusConflict:
+			conflict++
+		default:
+			t.Fatalf("unexpected status %d", s)
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("exactly one cutover should succeed, got %d ok and %d conflicts", ok, conflict)
+	}
+	_, body := c.do("GET", "/v1/streams/s1", nil)
+	st := decode[domain.StreamView](t, body)
+	if st.Revision != 1 {
+		t.Fatalf("revision should be 1, got %d", st.Revision)
+	}
+}
+
+func TestHTTPCutoverResponseLossRetryDoesNotReswitch(t *testing.T) {
+	c := newTestClient(t)
+	createStream(t, c, "s1", []string{"720p"})
+	payload := map[string]interface{}{
+		"generation":       2,
+		"cutoverId":        "co-1",
+		"expectedRevision": 0,
+		"renditions":       map[string]int64{"720p": 0},
+	}
+	cutover(t, c, "s1", payload)
+	c.do("POST", "/v1/streams/s1/segments", map[string]interface{}{
+		"rendition": "720p", "generation": 2, "submissionId": "s1",
+		"segments": []domain.Segment{seg(0, 2000, "a0")},
+	})
+	resp, body := cutover(t, c, "s1", payload)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("retry status %d: %s", resp.StatusCode, body)
+	}
+	cv := decode[domain.CutoverView](t, body)
+	if !cv.Idempotent {
+		t.Fatal("lost-response retry must be idempotent")
+	}
+	if cv.Revision != 1 {
+		t.Fatalf("retry must report original cutover revision 1, got %d", cv.Revision)
+	}
+	_, b := c.do("GET", "/v1/streams/s1", nil)
+	st := decode[domain.StreamView](t, b)
+	if st.Revision != 2 {
+		t.Fatalf("the later segment submit should still be reflected, revision=%d", st.Revision)
+	}
+	if st.Generation != 2 {
+		t.Fatalf("generation must remain 2, got %d", st.Generation)
+	}
+}

@@ -3,12 +3,16 @@ package domain
 import "fmt"
 
 const (
-	ErrCodeStreamNotFound  = "STREAM_NOT_FOUND"
-	ErrCodeStreamExists    = "STREAM_ALREADY_EXISTS"
-	ErrCodeInvalidRequest  = "INVALID_REQUEST"
-	ErrCodeConflict        = "CONFLICT"
-	ErrCodeStaleGeneration = "STALE_GENERATION"
-	ErrCodeInternal        = "INTERNAL"
+	ErrCodeStreamNotFound    = "STREAM_NOT_FOUND"
+	ErrCodeStreamExists      = "STREAM_ALREADY_EXISTS"
+	ErrCodeInvalidRequest    = "INVALID_REQUEST"
+	ErrCodeConflict          = "CONFLICT"
+	ErrCodeStaleGeneration   = "STALE_GENERATION"
+	ErrCodeRevisionMismatch  = "REVISION_MISMATCH"
+	ErrCodeCutoverConflict   = "CUTOVER_CONFLICT"
+	ErrCodeCutoverRequired   = "CUTOVER_REQUIRED"
+	ErrCodeSegmentOutOfRange = "SEGMENT_OUT_OF_RANGE"
+	ErrCodeInternal          = "INTERNAL"
 )
 
 type Error struct {
@@ -31,10 +35,11 @@ type Segment struct {
 }
 
 type RenditionState struct {
-	Name         string
-	HeadSequence int64
-	ContiguousMs int64
-	Segments     map[int64]Segment
+	Name          string
+	StartSequence int64
+	HeadSequence  int64
+	ContiguousMs  int64
+	Segments      map[int64]Segment
 }
 
 type SubmissionRecord struct {
@@ -45,6 +50,15 @@ type SubmissionRecord struct {
 	AppliedRevision int64
 }
 
+type CutoverRecord struct {
+	CutoverID        string
+	Generation       int64
+	ExpectedRevision int64
+	ContentHash      string
+	AppliedRevision  int64
+	Renditions       map[string]int64
+}
+
 type Stream struct {
 	ID                string
 	ActiveRenditions  map[string]struct{}
@@ -53,6 +67,7 @@ type Stream struct {
 	Renditions        map[string]*RenditionState
 	Revision          int64
 	Submissions       map[string]*SubmissionRecord
+	Cutovers          map[string]*CutoverRecord
 }
 
 type CreateStreamInput struct {
@@ -68,12 +83,21 @@ type SubmitSegmentsInput struct {
 	Segments     []Segment
 }
 
+type CutoverInput struct {
+	StreamID         string
+	Generation       int64
+	CutoverID        string
+	ExpectedRevision int64
+	Renditions       map[string]int64
+}
+
 type WatermarkView struct {
 	Sequence int64 `json:"sequence"`
 	TimeMs   int64 `json:"timeMs"`
 }
 
 type RenditionView struct {
+	StartSequence    int64 `json:"startSequence"`
 	HeadSequence     int64 `json:"headSequence"`
 	ContiguousTimeMs int64 `json:"contiguousTimeMs"`
 	BufferedSegments int   `json:"bufferedSegments"`
@@ -98,6 +122,17 @@ type SubmitResultView struct {
 	Accepted     int           `json:"accepted"`
 	HeadSequence int64         `json:"headSequence"`
 	Watermark    WatermarkView `json:"watermark"`
+}
+
+type CutoverView struct {
+	StreamID         string                   `json:"streamId"`
+	CutoverID        string                   `json:"cutoverId"`
+	Generation       int64                    `json:"generation"`
+	Revision         int64                    `json:"revision"`
+	Idempotent       bool                     `json:"idempotent"`
+	ActiveRenditions []string                 `json:"activeRenditions"`
+	Renditions       map[string]RenditionView `json:"renditions"`
+	Watermark        WatermarkView            `json:"watermark"`
 }
 
 type HealthView struct {

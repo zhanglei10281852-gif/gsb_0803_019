@@ -240,6 +240,36 @@ func TestIdempotentRetryDoesNotAdvanceRevision(t *testing.T) {
 	}
 }
 
+func TestIdempotentRetrySha256CaseInsensitive(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p"})
+	lower := testHash("a0")
+	upper := ""
+	for _, ch := range lower {
+		if ch >= 'a' && ch <= 'f' {
+			upper += string(ch - ('a' - 'A'))
+		} else {
+			upper += string(ch)
+		}
+	}
+	in1 := SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "720p", Generation: 1, SubmissionID: "sub-1",
+		Segments: []Segment{{Sequence: 0, DurationMs: 2000, Sha256: lower}},
+	}
+	if _, err := c.SubmitSegments(context.Background(), in1); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	in2 := in1
+	in2.Segments = []Segment{{Sequence: 0, DurationMs: 2000, Sha256: upper}}
+	res, err := c.SubmitSegments(context.Background(), in2)
+	if err != nil {
+		t.Fatalf("retry with different sha256 casing should be idempotent: %v", err)
+	}
+	if !res.Idempotent || res.Revision != 1 {
+		t.Fatalf("expected idempotent at revision 1, got %+v", res)
+	}
+}
+
 func TestSameSubmissionIDDifferentContentConflict(t *testing.T) {
 	c := newTestCoordinator()
 	createTestStream(t, c, "s1", []string{"720p"})
@@ -372,7 +402,7 @@ func TestStaleGenerationRejected(t *testing.T) {
 	}
 }
 
-func TestGenerationAdvanceResetsState(t *testing.T) {
+func TestCutoverResetsStateAndFencesOldGeneration(t *testing.T) {
 	c := newTestCoordinator()
 	createTestStream(t, c, "s1", []string{"720p", "480p"})
 	_, _ = c.SubmitSegments(context.Background(), SubmitSegmentsInput{
@@ -384,25 +414,484 @@ func TestGenerationAdvanceResetsState(t *testing.T) {
 		Segments: []Segment{seg(0, 2000, "b0")},
 	})
 
-	res, err := c.SubmitSegments(context.Background(), SubmitSegmentsInput{
-		StreamID: "s1", Rendition: "720p", Generation: 3, SubmissionID: "s3",
-		Segments: []Segment{seg(0, 4000, "c0")},
+	res, err := c.Cutover(context.Background(), CutoverInput{
+		StreamID: "s1", Generation: 3, CutoverID: "co-1", ExpectedRevision: 2,
+		Renditions: map[string]int64{"720p": 2, "480p": 1},
 	})
 	if err != nil {
-		t.Fatalf("submit: %v", err)
+		t.Fatalf("cutover: %v", err)
 	}
-	if res.Generation != 3 {
-		t.Fatalf("expected generation 3, got %d", res.Generation)
+	if res.Generation != 3 || res.Revision != 3 {
+		t.Fatalf("unexpected cutover result: %+v", res)
 	}
-	if res.HeadSequence != 1 {
-		t.Fatalf("head should reset to 1, got %d", res.HeadSequence)
+	if res.Idempotent {
+		t.Fatal("fresh cutover must not be idempotent")
 	}
-	if res.Watermark.Sequence != 0 || res.Watermark.TimeMs != 0 {
-		t.Fatalf("watermark should reset to 0 after generation advance, got %+v", res.Watermark)
+	if res.Renditions["720p"].StartSequence != 2 || res.Renditions["720p"].HeadSequence != 2 {
+		t.Fatalf("720p should start at 2: %+v", res.Renditions["720p"])
+	}
+	if res.Renditions["480p"].StartSequence != 1 || res.Renditions["480p"].HeadSequence != 1 {
+		t.Fatalf("480p should start at 1: %+v", res.Renditions["480p"])
+	}
+	if res.Watermark.Sequence != 2 || res.Watermark.TimeMs != 0 {
+		t.Fatalf("watermark should be at max start (2) with 0 new time: %+v", res.Watermark)
+	}
+
+	oldSubmit, err := c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "720p", Generation: 1, SubmissionID: "late",
+		Segments: []Segment{seg(2, 2000, "late-a2")},
+	})
+	if err == nil {
+		t.Fatalf("expected fencing error, got result: %+v", oldSubmit)
+	}
+	de, ok := err.(*Error)
+	if !ok || de.Code != ErrCodeStaleGeneration {
+		t.Fatalf("expected STALE_GENERATION, got %v", err)
+	}
+
+	st, _ := c.GetStatus(context.Background(), "s1")
+	if st.Revision != 3 {
+		t.Fatalf("fenced late write must not change revision; got %d", st.Revision)
+	}
+	if st.Renditions["720p"].HeadSequence != 2 || st.Renditions["480p"].HeadSequence != 1 {
+		t.Fatalf("fenced late write must not move heads: %+v", st.Renditions)
+	}
+	if st.Watermark.Sequence != 2 {
+		t.Fatalf("watermark must not move on fenced write: %+v", st.Watermark)
+	}
+
+	newRes, err := c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "720p", Generation: 3, SubmissionID: "s3",
+		Segments: []Segment{seg(2, 2000, "c2")},
+	})
+	if err != nil {
+		t.Fatalf("new generation submit: %v", err)
+	}
+	if newRes.HeadSequence != 3 {
+		t.Fatalf("720p head should advance to 3, got %d", newRes.HeadSequence)
+	}
+	if newRes.Watermark.Sequence != 2 || newRes.Watermark.TimeMs != 0 {
+		t.Fatalf("watermark must wait for 480p to reach 2: %+v", newRes.Watermark)
+	}
+}
+
+func TestCutoverIdempotentRetryDoesNotSwitchAgain(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p"})
+	in := CutoverInput{
+		StreamID: "s1", Generation: 2, CutoverID: "co-1", ExpectedRevision: 0,
+		Renditions: map[string]int64{"720p": 5},
+	}
+	first, err := c.Cutover(context.Background(), in)
+	if err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
+	if first.Revision != 1 || first.Idempotent {
+		t.Fatalf("unexpected first: %+v", first)
+	}
+
+	_, _ = c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "720p", Generation: 2, SubmissionID: "s1",
+		Segments: []Segment{seg(5, 2000, "c5")},
+	})
+
+	retry, err := c.Cutover(context.Background(), in)
+	if err != nil {
+		t.Fatalf("retry cutover: %v", err)
+	}
+	if !retry.Idempotent {
+		t.Fatal("retry must be idempotent")
+	}
+	if retry.Revision != 1 {
+		t.Fatalf("idempotent cutover must report original revision 1, got %d", retry.Revision)
 	}
 	st, _ := c.GetStatus(context.Background(), "s1")
-	if st.Generation != 3 {
-		t.Fatalf("expected status generation 3, got %d", st.Generation)
+	if st.Revision != 2 {
+		t.Fatalf("stream revision should be 2 after the segment submit, got %d", st.Revision)
+	}
+	if st.Renditions["720p"].HeadSequence != 6 {
+		t.Fatalf("head should have advanced from the new-gen submit, got %d", st.Renditions["720p"].HeadSequence)
+	}
+}
+
+func TestCutoverSameIDDifferentContentConflict(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p"})
+	_, err := c.Cutover(context.Background(), CutoverInput{
+		StreamID: "s1", Generation: 2, CutoverID: "co-1", ExpectedRevision: 0,
+		Renditions: map[string]int64{"720p": 5},
+	})
+	if err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		in   CutoverInput
+	}{
+		{"different generation", CutoverInput{
+			StreamID: "s1", Generation: 3, CutoverID: "co-1", ExpectedRevision: 1,
+			Renditions: map[string]int64{"720p": 5},
+		}},
+		{"different start", CutoverInput{
+			StreamID: "s1", Generation: 2, CutoverID: "co-1", ExpectedRevision: 1,
+			Renditions: map[string]int64{"720p": 6},
+		}},
+		{"different expected revision", CutoverInput{
+			StreamID: "s1", Generation: 2, CutoverID: "co-1", ExpectedRevision: 99,
+			Renditions: map[string]int64{"720p": 5},
+		}},
+		{"different rendition set", CutoverInput{
+			StreamID: "s1", Generation: 2, CutoverID: "co-1", ExpectedRevision: 1,
+			Renditions: map[string]int64{"720p": 5, "480p": 5},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.Cutover(context.Background(), tc.in)
+			if err == nil {
+				t.Fatal("expected conflict")
+			}
+			de, ok := err.(*Error)
+			if !ok || de.Code != ErrCodeCutoverConflict {
+				t.Fatalf("expected CUTOVER_CONFLICT, got %v", err)
+			}
+		})
+	}
+	st, _ := c.GetStatus(context.Background(), "s1")
+	if st.Generation != 2 || st.Revision != 1 {
+		t.Fatalf("state must not change on drift conflict: gen=%d rev=%d", st.Generation, st.Revision)
+	}
+}
+
+func TestCutoverExpectedRevisionMismatch(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p"})
+	_, _ = c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "720p", Generation: 1, SubmissionID: "s1",
+		Segments: []Segment{seg(0, 2000, "a0")},
+	})
+	_, err := c.Cutover(context.Background(), CutoverInput{
+		StreamID: "s1", Generation: 2, CutoverID: "co-1", ExpectedRevision: 0,
+		Renditions: map[string]int64{"720p": 1},
+	})
+	if err == nil {
+		t.Fatal("expected revision mismatch")
+	}
+	de, ok := err.(*Error)
+	if !ok || de.Code != ErrCodeRevisionMismatch {
+		t.Fatalf("expected REVISION_MISMATCH, got %v", err)
+	}
+	st, _ := c.GetStatus(context.Background(), "s1")
+	if st.Generation != 1 || st.Revision != 1 {
+		t.Fatalf("failed cutover must not change state: gen=%d rev=%d", st.Generation, st.Revision)
+	}
+}
+
+func TestCutoverGenerationRegression(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p"})
+	_, _ = c.Cutover(context.Background(), CutoverInput{
+		StreamID: "s1", Generation: 5, CutoverID: "co-1", ExpectedRevision: 0,
+		Renditions: map[string]int64{"720p": 0},
+	})
+	_, err := c.Cutover(context.Background(), CutoverInput{
+		StreamID: "s1", Generation: 5, CutoverID: "co-2", ExpectedRevision: 1,
+		Renditions: map[string]int64{"720p": 0},
+	})
+	if err == nil {
+		t.Fatal("expected stale generation for equal/regressed generation")
+	}
+	de, ok := err.(*Error)
+	if !ok || de.Code != ErrCodeStaleGeneration {
+		t.Fatalf("expected STALE_GENERATION, got %v", err)
+	}
+	_, err = c.Cutover(context.Background(), CutoverInput{
+		StreamID: "s1", Generation: 4, CutoverID: "co-3", ExpectedRevision: 1,
+		Renditions: map[string]int64{"720p": 0},
+	})
+	if err == nil {
+		t.Fatal("expected stale generation for lower generation")
+	}
+}
+
+func TestCutoverInvalidRenditionSet(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p"})
+	cases := []struct {
+		name string
+		in   CutoverInput
+	}{
+		{"empty renditions", CutoverInput{
+			StreamID: "s1", Generation: 2, CutoverID: "co", ExpectedRevision: 0,
+		}},
+		{"empty name", CutoverInput{
+			StreamID: "s1", Generation: 2, CutoverID: "co", ExpectedRevision: 0,
+			Renditions: map[string]int64{"": 0},
+		}},
+		{"negative start", CutoverInput{
+			StreamID: "s1", Generation: 2, CutoverID: "co", ExpectedRevision: 0,
+			Renditions: map[string]int64{"720p": -1},
+		}},
+		{"missing cutover id", CutoverInput{
+			StreamID: "s1", Generation: 2, ExpectedRevision: 0,
+			Renditions: map[string]int64{"720p": 0},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := c.Cutover(context.Background(), tc.in)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			de, ok := err.(*Error)
+			if !ok || de.Code != ErrCodeInvalidRequest {
+				t.Fatalf("expected INVALID_REQUEST, got %v", err)
+			}
+		})
+	}
+}
+
+func TestCutoverCanChangeActiveRenditionSet(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p", "480p"})
+	res, err := c.Cutover(context.Background(), CutoverInput{
+		StreamID: "s1", Generation: 2, CutoverID: "co-1", ExpectedRevision: 0,
+		Renditions: map[string]int64{"720p": 0, "1080p": 0},
+	})
+	if err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
+	if _, ok := res.Renditions["480p"]; ok {
+		t.Fatal("480p should have been removed during cutover")
+	}
+	if _, ok := res.Renditions["1080p"]; !ok {
+		t.Fatal("1080p should have been added during cutover")
+	}
+	if len(res.ActiveRenditions) != 2 {
+		t.Fatalf("expected 2 active renditions, got %v", res.ActiveRenditions)
+	}
+	_, err = c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "480p", Generation: 2, SubmissionID: "s1",
+		Segments: []Segment{seg(0, 2000, "b0")},
+	})
+	if err == nil {
+		t.Fatal("removed rendition must not accept segments")
+	}
+}
+
+func TestPartialNewPrimaryReadinessWatermarkWaits(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p", "480p"})
+	_, err := c.Cutover(context.Background(), CutoverInput{
+		StreamID: "s1", Generation: 2, CutoverID: "co-1", ExpectedRevision: 0,
+		Renditions: map[string]int64{"720p": 10, "480p": 8},
+	})
+	if err != nil {
+		t.Fatalf("cutover: %v", err)
+	}
+
+	r720, _ := c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "720p", Generation: 2, SubmissionID: "s1",
+		Segments: []Segment{seg(10, 2000, "c10"), seg(11, 2000, "c11")},
+	})
+	if r720.HeadSequence != 12 {
+		t.Fatalf("720p head should be 12, got %d", r720.HeadSequence)
+	}
+	if r720.Watermark.Sequence != 10 || r720.Watermark.TimeMs != 0 {
+		t.Fatalf("watermark must hold at max start 10 until 480p catches up: %+v", r720.Watermark)
+	}
+
+	r480, _ := c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "480p", Generation: 2, SubmissionID: "s2",
+		Segments: []Segment{seg(8, 2000, "d8"), seg(9, 2000, "d9")},
+	})
+	if r480.HeadSequence != 10 {
+		t.Fatalf("480p head should be 10, got %d", r480.HeadSequence)
+	}
+	if r480.Watermark.Sequence != 10 || r480.Watermark.TimeMs != 4000 {
+		t.Fatalf("watermark should advance to 10 with 4000ms once both reach common floor: %+v", r480.Watermark)
+	}
+
+	_, _ = c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "480p", Generation: 2, SubmissionID: "s3",
+		Segments: []Segment{seg(10, 2000, "d10")},
+	})
+	st, _ := c.GetStatus(context.Background(), "s1")
+	if st.Watermark.Sequence != 11 {
+		t.Fatalf("watermark should be 11 (min head) after 480p catches up, got %d", st.Watermark.Sequence)
+	}
+}
+
+func TestSubmitHigherGenerationWithoutCutoverRejected(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p"})
+	_, _ = c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "720p", Generation: 1, SubmissionID: "s1",
+		Segments: []Segment{seg(0, 2000, "a0")},
+	})
+	_, err := c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "720p", Generation: 2, SubmissionID: "s2",
+		Segments: []Segment{seg(1, 2000, "a1")},
+	})
+	if err == nil {
+		t.Fatal("expected cutover-required error")
+	}
+	de, ok := err.(*Error)
+	if !ok || de.Code != ErrCodeCutoverRequired {
+		t.Fatalf("expected CUTOVER_REQUIRED, got %v", err)
+	}
+	st, _ := c.GetStatus(context.Background(), "s1")
+	if st.Generation != 1 || st.Revision != 1 {
+		t.Fatalf("rejected submit must not change state: gen=%d rev=%d", st.Generation, st.Revision)
+	}
+}
+
+func TestSegmentBeforeStartSequenceRejected(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p"})
+	_, _ = c.Cutover(context.Background(), CutoverInput{
+		StreamID: "s1", Generation: 2, CutoverID: "co-1", ExpectedRevision: 0,
+		Renditions: map[string]int64{"720p": 5},
+	})
+	_, err := c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "720p", Generation: 2, SubmissionID: "s1",
+		Segments: []Segment{seg(4, 2000, "below")},
+	})
+	if err == nil {
+		t.Fatal("expected out-of-range error")
+	}
+	de, ok := err.(*Error)
+	if !ok || de.Code != ErrCodeSegmentOutOfRange {
+		t.Fatalf("expected SEGMENT_OUT_OF_RANGE, got %v", err)
+	}
+	st, _ := c.GetStatus(context.Background(), "s1")
+	if st.Renditions["720p"].HeadSequence != 5 || st.Renditions["720p"].BufferedSegments != 0 {
+		t.Fatalf("rejected batch must leave no partial state: %+v", st.Renditions["720p"])
+	}
+}
+
+func TestConcurrentCutoversOneWins(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p"})
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	revMismatch := 0
+	success := 0
+	var mu sync.Mutex
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res, err := c.Cutover(context.Background(), CutoverInput{
+				StreamID: "s1", Generation: int64(i + 2), CutoverID: fmt.Sprintf("co-%d", i),
+				ExpectedRevision: 0,
+				Renditions:       map[string]int64{"720p": int64(i)},
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			mu.Lock()
+			success++
+			_ = res
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		de, ok := err.(*Error)
+		if !ok || de.Code != ErrCodeRevisionMismatch {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		revMismatch++
+	}
+	if success != 1 {
+		t.Fatalf("exactly one cutover should succeed, got %d (mismatches=%d)", success, revMismatch)
+	}
+	st, _ := c.GetStatus(context.Background(), "s1")
+	if st.Revision != 1 {
+		t.Fatalf("revision should be exactly 1, got %d", st.Revision)
+	}
+}
+
+func TestInFlightOldWriteLinearizedBeforeOrAfterCutover(t *testing.T) {
+	c := newTestCoordinator()
+	createTestStream(t, c, "s1", []string{"720p"})
+	_, _ = c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+		StreamID: "s1", Rendition: "720p", Generation: 1, SubmissionID: "old-1",
+		Segments: []Segment{seg(0, 2000, "a0")},
+	})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	oldDone := make(chan error, 1)
+	cutDone := make(chan error, 1)
+	go func() {
+		defer wg.Done()
+		_, err := c.SubmitSegments(context.Background(), SubmitSegmentsInput{
+			StreamID: "s1", Rendition: "720p", Generation: 1, SubmissionID: "old-2",
+			Segments: []Segment{seg(1, 2000, "a1")},
+		})
+		oldDone <- err
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := c.Cutover(context.Background(), CutoverInput{
+			StreamID: "s1", Generation: 2, CutoverID: "co-1", ExpectedRevision: 1,
+			Renditions: map[string]int64{"720p": 2},
+		})
+		cutDone <- err
+	}()
+	wg.Wait()
+
+	oldErr := <-oldDone
+	cutErr := <-cutDone
+	st, _ := c.GetStatus(context.Background(), "s1")
+
+	if cutErr == nil {
+		if oldErr == nil {
+			t.Fatal("if cutover landed first, the old write must be fenced")
+		}
+		if de, ok := oldErr.(*Error); !ok || de.Code != ErrCodeStaleGeneration {
+			t.Fatalf("expected STALE_GENERATION for fenced old write, got %v", oldErr)
+		}
+		if st.Generation != 2 || st.Revision != 2 {
+			t.Fatalf("expected gen=2 rev=2 after cutover+fence, got gen=%d rev=%d", st.Generation, st.Revision)
+		}
+		if st.Renditions["720p"].HeadSequence != 2 {
+			t.Fatalf("head should be cutover start 2, got %d", st.Renditions["720p"].HeadSequence)
+		}
+	} else {
+		if de, ok := cutErr.(*Error); !ok || de.Code != ErrCodeRevisionMismatch {
+			t.Fatalf("if old write landed first, cutover should fail REVISION_MISMATCH, got %v", cutErr)
+		}
+		if oldErr != nil {
+			t.Fatalf("old write before cutover should succeed, got %v", oldErr)
+		}
+		if st.Generation != 1 || st.Revision != 2 {
+			t.Fatalf("expected gen=1 rev=2 when old write landed first, got gen=%d rev=%d", st.Generation, st.Revision)
+		}
+		if st.Renditions["720p"].HeadSequence != 2 {
+			t.Fatalf("head should be 2 after old write, got %d", st.Renditions["720p"].HeadSequence)
+		}
+	}
+}
+
+func TestCutoverToMissingStream(t *testing.T) {
+	c := newTestCoordinator()
+	_, err := c.Cutover(context.Background(), CutoverInput{
+		StreamID: "nope", Generation: 1, CutoverID: "co", ExpectedRevision: 0,
+		Renditions: map[string]int64{"720p": 0},
+	})
+	if err == nil {
+		t.Fatal("expected not found")
+	}
+	de, ok := err.(*Error)
+	if !ok || de.Code != ErrCodeStreamNotFound {
+		t.Fatalf("expected STREAM_NOT_FOUND, got %v", err)
 	}
 }
 
