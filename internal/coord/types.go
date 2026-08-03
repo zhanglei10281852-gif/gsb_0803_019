@@ -33,10 +33,41 @@ type IngestResult struct {
 	Replayed   bool   `json:"replayed"`
 }
 
+// RenditionResume declares where one active rendition of the new generation
+// resumes publishing after a cutover.
+type RenditionResume struct {
+	Name          string `json:"name"`
+	StartSequence int64  `json:"startSequence"`
+}
+
+// CutoverRequest atomically switches a stream to a higher producer
+// generation with a newly declared active rendition set, guarded by
+// optimistic concurrency on the stream revision.
+type CutoverRequest struct {
+	CutoverID        string            `json:"cutoverId"`
+	ExpectedRevision int64             `json:"expectedRevision"`
+	Generation       int64             `json:"generation"`
+	Renditions       []RenditionResume `json:"renditions"`
+}
+
+// CutoverResult is the committed outcome of a cutover. On an idempotent
+// replay (e.g. the original response was lost) the originally committed
+// result is returned with Replayed set to true.
+type CutoverResult struct {
+	StreamID   string                     `json:"streamId"`
+	CutoverID  string                     `json:"cutoverId"`
+	Generation int64                      `json:"generation"`
+	Revision   int64                      `json:"revision"`
+	Watermark  int64                      `json:"watermark"`
+	Renditions map[string]RenditionStatus `json:"renditions"`
+	Replayed   bool                       `json:"replayed"`
+}
+
 // RenditionStatus exposes the contiguous head of one active rendition in the
 // stream's current generation. Head is the last sequence of the gap-free
-// prefix starting at sequence 0, or -1 when empty. Buffered counts segments
-// stored beyond the head (out-of-order, waiting on gaps).
+// prefix starting at the rendition's start sequence, or start-1 when empty.
+// Buffered counts segments stored beyond the head (out-of-order, waiting on
+// gaps).
 type RenditionStatus struct {
 	Head     int64 `json:"head"`
 	Buffered int   `json:"buffered"`
@@ -60,6 +91,8 @@ const (
 	CodeStaleGeneration    = "stale_generation"
 	CodeSubmissionConflict = "submission_conflict"
 	CodeSegmentConflict    = "segment_conflict"
+	CodeRevisionConflict   = "revision_conflict"
+	CodeCutoverConflict    = "cutover_conflict"
 )
 
 // Error is a domain error with a stable machine-readable code.

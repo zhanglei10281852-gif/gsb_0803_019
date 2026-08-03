@@ -24,10 +24,11 @@ const (
 
 // Server routes:
 //
-//	POST /v1/streams                    create a stream, declaring active renditions
-//	POST /v1/streams/{streamId}/ingest  commit a batch of segments (idempotent by submissionId)
-//	GET  /v1/streams/{streamId}/status  revision, per-rendition heads, publish watermark
-//	GET  /healthz                       liveness probe
+//	POST /v1/streams                     create a stream, declaring active renditions
+//	POST /v1/streams/{streamId}/ingest   commit a batch of segments (idempotent by submissionId)
+//	POST /v1/streams/{streamId}/cutover  atomic primary/backup switch, guarded by expectedRevision
+//	GET  /v1/streams/{streamId}/status   revision, per-rendition heads, publish watermark
+//	GET  /healthz                        liveness probe
 type Server struct {
 	coord *coord.Coordinator
 	mux   *http.ServeMux
@@ -38,6 +39,7 @@ func NewServer(c *coord.Coordinator) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/streams", s.handleCreateStream)
 	mux.HandleFunc("POST /v1/streams/{streamId}/ingest", s.handleIngest)
+	mux.HandleFunc("POST /v1/streams/{streamId}/cutover", s.handleCutover)
 	mux.HandleFunc("GET /v1/streams/{streamId}/status", s.handleStatus)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux = mux
@@ -75,7 +77,9 @@ func statusForCode(code string) int {
 	case coord.CodeAlreadyExists,
 		coord.CodeSubmissionConflict,
 		coord.CodeSegmentConflict,
-		coord.CodeStaleGeneration:
+		coord.CodeStaleGeneration,
+		coord.CodeRevisionConflict,
+		coord.CodeCutoverConflict:
 		return http.StatusConflict
 	case codeUnsupportedMediaType:
 		return http.StatusUnsupportedMediaType
@@ -136,6 +140,20 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.coord.Ingest(r.PathValue("streamId"), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleCutover(w http.ResponseWriter, r *http.Request) {
+	var req coord.CutoverRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	res, err := s.coord.Cutover(r.PathValue("streamId"), req)
 	if err != nil {
 		writeError(w, err)
 		return

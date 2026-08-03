@@ -1,20 +1,25 @@
 package coord
 
 // renditionState holds the buffered segments of one active rendition for the
-// stream's current generation. head is the last sequence of the gap-free
-// prefix starting at sequence 0 (-1 when empty); it never crosses a gap.
+// stream's current generation. start is where this generation resumes
+// publishing (0 for the initial generation, the declared resume point after
+// a cutover). head is the last sequence of the gap-free prefix starting at
+// start (start-1 when empty); it never crosses a gap and never borrows
+// progress from an older generation.
 type renditionState struct {
 	segments map[int64]Segment
+	start    int64
 	head     int64
 }
 
-func newRenditionState() *renditionState {
-	return &renditionState{segments: make(map[int64]Segment), head: -1}
+func newRenditionState(start int64) *renditionState {
+	return &renditionState{segments: make(map[int64]Segment), start: start, head: start - 1}
 }
 
-func (r *renditionState) reset() {
+func (r *renditionState) reset(start int64) {
 	r.segments = make(map[int64]Segment)
-	r.head = -1
+	r.start = start
+	r.head = start - 1
 }
 
 // submissionRecord pins the fingerprint and the committed result of an
@@ -24,12 +29,20 @@ type submissionRecord struct {
 	result      IngestResult
 }
 
+// cutoverRecord pins the fingerprint and the committed result of an accepted
+// cutover so a retried switch (lost response) replays without re-switching.
+type cutoverRecord struct {
+	fingerprint string
+	result      CutoverResult
+}
+
 type streamState struct {
 	id          string
 	generation  int64
 	revision    int64
 	renditions  map[string]*renditionState
 	submissions map[string]submissionRecord
+	cutovers    map[string]cutoverRecord
 }
 
 // watermark is the highest sequence every active rendition has completed

@@ -62,9 +62,10 @@ func (c *Coordinator) CreateStream(streamID string, renditions []string) (Status
 		revision:    1,
 		renditions:  make(map[string]*renditionState, len(renditions)),
 		submissions: make(map[string]submissionRecord),
+		cutovers:    make(map[string]cutoverRecord),
 	}
 	for _, r := range renditions {
-		st.renditions[r] = newRenditionState()
+		st.renditions[r] = newRenditionState(0)
 	}
 	c.store.put(st)
 	return statusOf(st), nil
@@ -143,7 +144,7 @@ func (c *Coordinator) Ingest(streamID string, req IngestRequest) (IngestResult, 
 	if req.Generation > st.generation {
 		st.generation = req.Generation
 		for _, r := range st.renditions {
-			r.reset()
+			r.reset(0)
 		}
 		rend = st.renditions[req.Rendition]
 	}
@@ -191,20 +192,104 @@ func (c *Coordinator) Status(streamID string) (Status, error) {
 	return statusOf(st), nil
 }
 
-func statusOf(st *streamState) Status {
+// Cutover atomically switches a stream to a higher producer generation with
+// a newly declared active rendition set. It is guarded by expectedRevision
+// (optimistic concurrency) and idempotent by cutoverId: an as-is retry of a
+// committed cutover replays the original result instead of switching again.
+// A failed cutover (stale revision, generation regression, invalid set)
+// leaves the stream untouched and records nothing.
+func (c *Coordinator) Cutover(streamID string, req CutoverRequest) (CutoverResult, error) {
+	if err := validateName("streamId", streamID); err != nil {
+		return CutoverResult{}, err
+	}
+	if req.CutoverID == "" {
+		return CutoverResult{}, errorf(CodeInvalidArgument, "cutoverId must not be empty")
+	}
+	if len(req.CutoverID) > maxNameLen {
+		return CutoverResult{}, errorf(CodeInvalidArgument, "cutoverId exceeds %d characters", maxNameLen)
+	}
+	if req.ExpectedRevision < 1 {
+		return CutoverResult{}, errorf(CodeInvalidArgument, "expectedRevision must be >= 1")
+	}
+	if req.Generation < 0 {
+		return CutoverResult{}, errorf(CodeInvalidArgument, "generation must be >= 0")
+	}
+	if err := validateResumeSet(req.Renditions); err != nil {
+		return CutoverResult{}, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	st, ok := c.store.get(streamID)
+	if !ok {
+		return CutoverResult{}, errorf(CodeNotFound, "stream %q not found", streamID)
+	}
+
+	// Idempotency is checked before the revision/generation gates so that a
+	// retried switch whose response was lost still replays the committed
+	// result — the gates would now reject it as stale.
+	fp := cutoverFingerprint(req)
+	if rec, ok := st.cutovers[req.CutoverID]; ok {
+		if rec.fingerprint != fp {
+			return CutoverResult{}, errorf(CodeCutoverConflict,
+				"cutoverId %q was already used with different content", req.CutoverID)
+		}
+		res := rec.result
+		res.Replayed = true
+		return res, nil
+	}
+
+	if req.ExpectedRevision != st.revision {
+		return CutoverResult{}, errorf(CodeRevisionConflict,
+			"expectedRevision %d does not match current revision %d", req.ExpectedRevision, st.revision)
+	}
+	if req.Generation <= st.generation {
+		return CutoverResult{}, errorf(CodeStaleGeneration,
+			"generation %d does not advance current generation %d", req.Generation, st.generation)
+	}
+
+	// Commit point: replace the rendition set and generation atomically.
+	// Everything from older generations — heads, buffered segments — is
+	// discarded; only submission/cutover records survive for idempotency.
+	st.generation = req.Generation
+	rends := make(map[string]*renditionState, len(req.Renditions))
+	for _, r := range req.Renditions {
+		rends[r.Name] = newRenditionState(r.StartSequence)
+	}
+	st.renditions = rends
+	st.revision++
+
+	res := CutoverResult{
+		StreamID:   streamID,
+		CutoverID:  req.CutoverID,
+		Generation: req.Generation,
+		Revision:   st.revision,
+		Watermark:  st.watermark(),
+		Renditions: renditionStatuses(st),
+	}
+	st.cutovers[req.CutoverID] = cutoverRecord{fingerprint: fp, result: res}
+	return res, nil
+}
+
+func renditionStatuses(st *streamState) map[string]RenditionStatus {
 	rends := make(map[string]RenditionStatus, len(st.renditions))
 	for name, r := range st.renditions {
 		rends[name] = RenditionStatus{
 			Head:     r.head,
-			Buffered: len(r.segments) - int(r.head+1),
+			Buffered: len(r.segments) - int(r.head-r.start+1),
 		}
 	}
+	return rends
+}
+
+func statusOf(st *streamState) Status {
 	return Status{
 		StreamID:   st.id,
 		Revision:   st.revision,
 		Generation: st.generation,
 		Watermark:  st.watermark(),
-		Renditions: rends,
+		Renditions: renditionStatuses(st),
 	}
 }
 
@@ -228,6 +313,44 @@ func fingerprint(req IngestRequest) string {
 		fmt.Fprintf(h, "%d:%d:%s\x00", s.Sequence, s.DurationMs, s.SHA256)
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// cutoverFingerprint hashes the canonical (name-ordered) content of a
+// cutover request so that an as-is retry is recognized while any content
+// drift — including expectedRevision or resume points — conflicts.
+func cutoverFingerprint(req CutoverRequest) string {
+	rs := make([]RenditionResume, len(req.Renditions))
+	copy(rs, req.Renditions)
+	sort.Slice(rs, func(i, j int) bool { return rs[i].Name < rs[j].Name })
+	h := sha256.New()
+	h.Write([]byte(strconv.FormatInt(req.ExpectedRevision, 10)))
+	h.Write([]byte{0})
+	h.Write([]byte(strconv.FormatInt(req.Generation, 10)))
+	h.Write([]byte{0})
+	for _, r := range rs {
+		fmt.Fprintf(h, "%s:%d\x00", r.Name, r.StartSequence)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func validateResumeSet(in []RenditionResume) error {
+	if len(in) == 0 {
+		return errorf(CodeInvalidArgument, "renditions must declare at least one active rendition")
+	}
+	seen := make(map[string]struct{}, len(in))
+	for i, r := range in {
+		if err := validateName("rendition", r.Name); err != nil {
+			return err
+		}
+		if r.StartSequence < 0 {
+			return errorf(CodeInvalidArgument, "renditions[%d]: startSequence must be >= 0", i)
+		}
+		if _, dup := seen[r.Name]; dup {
+			return errorf(CodeInvalidArgument, "duplicate rendition %q", r.Name)
+		}
+		seen[r.Name] = struct{}{}
+	}
+	return nil
 }
 
 func validateName(field, v string) error {
